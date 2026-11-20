@@ -1,0 +1,206 @@
+name: ai-homelab
+
+services:
+  # Ollama - LLM inference
+  ollama:
+    image: ollama/ollama:0.3.12
+    restart: unless-stopped
+    pids_limit: 1000
+    shm_size: 8gb
+    tty: true
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/ollama/models:/root/.ollama/models
+      - ./data/ollama/cache:/root/.ollama/cache
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_MAX_LOADED_MODELS=2
+      - OLLAMA_GPUMemory=0.9
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Dify - AI workflow platform
+  dify-api:
+    image: langgenius/dify-api:0.6.12
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./data/dify/weaviate:/var/lib/weaviate
+      - ./data/dify/uploaded_files:/app/api/uploaded_files
+      - ./data/dify/logs:/app/api/logs
+    environment:
+      - APP_ENV=production
+      - CONSOLE_WEB_URL=http://localhost:3010
+      - SERVICE_WEB_URL=http://localhost:3000
+      - EMBEDDING_MODEL=text-embedding-ada-002
+      - VECTOR_STORE=weaviate
+      - STORAGE_TYPE=local
+      - DATABASE_TYPE=sqlite
+      - REDIS_URL=redis://dify-redis:6379
+    depends_on:
+      - dify-redis
+      - dify-db
+      - dify-worker
+
+  dify-web:
+    image: langgenius/dify-web:0.6.12
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - CONSOLE_API_URL=http://dify-api:5001
+      - SERVICE_API_URL=http://dify-api:5001
+    depends_on:
+      - dify-api
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dify.rule=Host(`ai.localhost`)"
+      - "traefik.http.routers.dify.entrypoints=websecure"
+      - "traefik.http.routers.dify.tls.certresolver=myresolver"
+
+  dify-worker:
+    image: langgenius/dify-api:0.6.12
+    restart: unless-stopped
+    command: ["celery", "-A", "app.worker", "worker", "--loglevel=info", "-P", "gevent", "-c", "1"]
+    environment:
+      - APP_ENV=production
+      - CONSOLE_WEB_URL=http://localhost:3010
+      - EMBEDDING_MODEL=text-embedding-ada-002
+      - VECTOR_STORE=weaviate
+      - STORAGE_TYPE=local
+      - DATABASE_TYPE=sqlite
+      - REDIS_URL=redis://dify-redis:6379
+    depends_on:
+      - dify-redis
+      - dify-db
+
+  dify-redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    volumes:
+      - ./data/dify/redis:/data
+    command: redis-server --appendonly yes
+
+  dify-db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=dify
+      - POSTGRES_USER=dify
+      - POSTGRES_PASSWORD=dify-secret
+    volumes:
+      - ./data/dify/postgres:/var/lib/postgresql/data
+
+  # Qdrant - Vector database
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant/storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__API_KEY=your-api-key
+
+  # MinIO - S3-compatible storage
+  minio:
+    image: minio/minio:RELEASE.2024-03-15T01-07-19Z
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"  # Console
+    volumes:
+      - ./data/minio/data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+
+  # n8n - Workflow automation
+  n8n:
+    image: n8nio/n8n:1.59.0
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    volumes:
+      - ./data/n8n/data:/home/node/.n8n
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=n8n
+      - N8N_BASIC_AUTH_PASSWORD=n8n-password
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - NODE_ENV=production
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.localhost`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=myresolver"
+
+  # Traefik - Reverse proxy with SSL
+  traefik:
+    image: traefik:v2.11.0
+    restart: unless-stopped
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.email=your-email@example.com"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.myresolver.acme.httpchallenge.entriespoint=web"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Dashboard
+    volumes:
+      - ./data/traefik/letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.localhost`)"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=myresolver"
+
+  # Prometheus - Metrics
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./data/prometheus:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=90d"
+
+  # Grafana - Dashboards
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
+networks:
+  default:
+    name: ai-homelab-network
+    driver: bridge
